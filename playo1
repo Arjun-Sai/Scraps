@@ -1,0 +1,58 @@
+#Pip installs
+!pip install -q playwright pandas
+!playwright install chromium
+
+#Main Script
+import pandas as pd
+import asyncio
+from playwright.async_api import async_playwright
+
+async def scrape_articles():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        await page.goto("https://www.indiacode.nic.in/handle/123456789/1362/simple-search", timeout=60000)
+        await page.wait_for_selector('.artifact-description a')
+
+        articles = await page.query_selector_all('.artifact-description a')
+        articles = articles[:20]
+
+        data = []
+
+        for article in articles:
+            title = (await article.inner_text()).strip()
+            link = await article.get_attribute('href')
+            full_url = "https://www.indiacode.nic.in" + link
+
+            new_tab = await context.new_page()
+            await new_tab.goto(full_url, timeout=60000)
+            await new_tab.wait_for_timeout(2000)
+
+            try:
+                pub_date = await new_tab.locator(".simple-item-view-date").inner_text()
+            except:
+                pub_date = "N/A"
+
+            try:
+                content_blocks = await new_tab.query_selector_all(".simple-item-view-description")
+                content_text = " ".join([await block.inner_text() for block in content_blocks])
+            except:
+                content_text = ""
+
+            data.append({
+                "Article Name": title,
+                "Published Date": pub_date,
+                "URL": full_url,
+                "Content": content_text.strip()
+            })
+
+            await new_tab.close()
+
+        await browser.close()
+        return pd.DataFrame(data)
+
+df = asyncio.run(scrape_articles())
+df.to_csv("indiacode_first_20_playwright.csv", index=False)
+df.head()
