@@ -1,0 +1,78 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from urllib.parse import urljoin
+import time
+
+def extract_act_list_from_indiacode(base_url, headers):
+    """
+    Extracts a list of Acts with Title, Date, and Details Page URL
+    """
+    print(f"🔍 Fetching data from:\n{base_url}\n")
+    response = requests.get(base_url, headers=headers)
+
+    if response.status_code != 200:
+        print("❌ Failed to fetch the page. Status code:", response.status_code)
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    rows = soup.select("tr")
+    results = []
+
+    print(f"📄 Found {len(rows)} rows to scan...\n")
+
+    for idx, row in enumerate(rows, 1):
+        try:
+            title_cell = row.select_one('td[headers="t3"]')
+            date_cell = row.select_one('td[headers="t1"]')
+            link_cell = row.select_one('td[headers="t4"] a')
+
+            if not title_cell or not date_cell or not link_cell:
+                continue  # Skip rows without all data
+
+            title = title_cell.get_text(strip=True)
+            date = date_cell.get_text(strip=True)
+            relative_link = link_cell.get("href", "").strip()
+            full_url = urljoin("https://www.indiacode.nic.in", relative_link)
+
+            print(f"▶️ {idx}. Title: {title}")
+            print(f"    📅 Date: {date}")
+            print(f"    🔗 URL: {full_url}")
+
+            results.append({
+                "Title": title,
+                "Date": date,
+                "Details Page URL": full_url
+            })
+
+            time.sleep(0.5)  # polite delay
+
+        except Exception as e:
+            print(f"⚠️ Error processing row {idx}: {e}")
+            continue
+
+    return results
+
+def main_indiacode_scraper():
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    # You can update this URL to target another state/collection
+    base_url = "https://www.indiacode.nic.in/handle/123456789/1362"
+
+    data = extract_act_list_from_indiacode(base_url, headers)
+
+    if not data:
+        print("❌ No data extracted.")
+        return
+
+    df = pd.DataFrame(data)
+    df.to_excel("indiacode_acts_list.xlsx", index=False)
+    print("\n✅ Done. Saved to 'indiacode_acts_list.xlsx'")
+    print("\nSample Preview:")
+    pd.set_option("display.max_colwidth", None)
+    print(df.head())
+
+# Run the scraper
+main_indiacode_scraper()
