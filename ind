@@ -1,0 +1,67 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+
+# === Step 1: Configuration ===
+BASE_URL = "https://www.indiacode.nic.in"
+headers = {
+    "User-Agent": "Mozilla/5.0"
+}
+
+# === Step 2: Main Listing Page URL ===
+search_url = "https://www.indiacode.nic.in/handle/123456789/1362/simple-search"
+response = requests.get(search_url, headers=headers)
+
+if response.status_code != 200:
+    print("❌ Failed to load the main listing page.")
+    exit()
+
+soup = BeautifulSoup(response.text, "html.parser")
+
+# === Step 3: Get all acts and links ===
+acts = soup.select("a.allacts")
+
+print(f"🔍 Found {len(acts)} acts to process...\n")
+
+results = []
+
+# === Step 4: Visit each act page and extract PDF link ===
+for idx, act in enumerate(acts, 1):
+    title = act.text.strip()
+    act_relative_url = act.get("href")
+    act_detail_url = BASE_URL + act_relative_url
+
+    print(f"[{idx}] Visiting: {title}")
+
+    try:
+        detail_resp = requests.get(act_detail_url, headers=headers)
+        detail_soup = BeautifulSoup(detail_resp.text, "html.parser")
+
+        # Try to find the first PDF download link
+        pdf_tag = detail_soup.find("a", href=lambda x: x and x.startswith("/bitstream/") and x.endswith(".pdf"))
+
+        if pdf_tag:
+            pdf_url = BASE_URL + pdf_tag.get("href")
+        else:
+            pdf_url = "PDF not found"
+
+        results.append({
+            "Title": title,
+            "PDF_URL": pdf_url
+        })
+
+        time.sleep(0.5)  # Polite delay
+
+    except Exception as e:
+        print(f"   ❌ Error fetching: {e}")
+        results.append({
+            "Title": title,
+            "PDF_URL": "Error"
+        })
+
+# === Step 5: Save results ===
+df = pd.DataFrame(results)
+df.to_excel("indiacode_act_links.xlsx", index=False)
+
+print("\n✅ Done! Data saved to 'indiacode_act_links.xlsx'")
