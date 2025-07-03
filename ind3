@@ -1,0 +1,110 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from urllib.parse import urljoin
+from datetime import datetime, timedelta
+import time
+
+def extract_act_list_from_indiacode(base_url, headers, year):
+    """
+    Extracts a list of Acts for a given year.
+    """
+    # Update URL for the given year
+    full_url = (
+        f"{base_url}"
+        f"?page-token=032a83544a3b&page-token-value=98ed972cd138f7f10f4cc9e781e1e030"
+        f"&nccharset=8B2E7B36&location=%2F&query=&rpp=100"
+        f"&sort_by=dc.date.issued_dt&order=desc"
+        f"&filter_field_1=enactmentdate&filter_type_1=contains"
+        f"&filter_value_1={year}"
+    )
+
+    print(f"🔍 Fetching data for year {year} from:\n{full_url}\n")
+    response = requests.get(full_url, headers=headers)
+
+    if response.status_code != 200:
+        print("❌ Failed to fetch the page. Status code:", response.status_code)
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    rows = soup.select("tr")
+    results = []
+
+    print(f"📄 Found {len(rows)} rows to scan...\n")
+
+    for idx, row in enumerate(rows, 1):
+        try:
+            title_cell = row.select_one('td[headers="t3"]')
+            date_cell = row.select_one('td[headers="t1"]')
+            link_cell = row.select_one('td[headers="t4"] a')
+
+            if not title_cell or not date_cell or not link_cell:
+                continue
+
+            title = title_cell.get_text(strip=True)
+            date = date_cell.get_text(strip=True)
+            relative_link = link_cell.get("href", "").strip()
+            full_url = urljoin("https://www.indiacode.nic.in", relative_link)
+
+            print(f"▶️ {idx}. Title: {title}")
+            print(f"    📅 Date: {date}")
+            print(f"    🔗 URL: {full_url}")
+
+            results.append({
+                "Title": title,
+                "Date": date,
+                "Details Page URL": full_url
+            })
+
+            time.sleep(0.5)
+
+        except Exception as e:
+            print(f"⚠️ Error processing row {idx}: {e}")
+            continue
+
+    return results
+
+def main_indiacode_scraper_with_days():
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    base_url = "https://www.indiacode.nic.in/handle/123456789/1362/simple-search"
+
+    # === Step 1: User input
+    try:
+        num_days = int(input("Enter number of days to look back: ").strip())
+    except ValueError:
+        print("❌ Please enter a valid number.")
+        return
+
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=num_days)
+
+    print(f"📆 Looking for Acts between {start_date.date()} and {end_date.date()}\n")
+
+    # === Step 2: Get range of years to scrape
+    years = list(range(start_date.year, end_date.year + 1))
+
+    all_data = []
+    for year in years:
+        data = extract_act_list_from_indiacode(base_url, headers, year)
+        all_data.extend(data)
+
+    if not all_data:
+        print("❌ No data extracted.")
+        return
+
+    df = pd.DataFrame(all_data)
+    df.to_excel("indiacode_filtered_acts.xlsx", index=False)
+
+    print("\n✅ Done. Data saved to 'indiacode_filtered_acts.xlsx'")
+    pd.set_option("display.max_colwidth", None)
+    print("\nSample Preview:")
+    print(df.head())
+
+# Run the main function
+main_indiacode_scraper_with_days()
+
+
+Updated India nic code bro.. please port it whenever you can.
