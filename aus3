@@ -1,0 +1,162 @@
+import requests
+from datetime import datetime, timedelta
+import pandas as pd
+import time
+import io
+import PyPDF2
+
+
+def extract_pdf_content(pdf_url, headers):
+    try:
+        response = requests.get(pdf_url, headers=headers, timeout=30)
+        if response.status_code != 200:
+            return None
+        pdf_file = io.BytesIO(response.content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        text_content = []
+        for page in pdf_reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_content.append(page_text)
+        return " ".join(" ".join(text_content).split())
+    except Exception as e:
+        print(f"⚠️ Failed to read PDF: {e}")
+        return None
+
+
+def extract_content_with_fallback(pdf_url, headers):
+    print(f"🔍 Trying base PDF: {pdf_url}")
+    base_content = extract_pdf_content(pdf_url, headers)
+
+    if base_content and len(base_content.strip()) > 100:
+        return base_content
+
+    print("🔁 Base failed. Trying multi-volume fallback...")
+    parts = []
+    volume = 1
+
+    while True:
+        vol_url = f"{pdf_url}/{volume}"
+        try:
+            response = requests.head(vol_url, headers=headers, timeout=10)
+            if response.status_code != 200:
+                print(f"❌ Volume {volume} not found. Stopping.")
+                break
+
+            print(f"✅ Volume {volume} found. Extracting...")
+            vol_content = extract_pdf_content(vol_url, headers)
+            if vol_content:
+                parts.append(f"=== VOLUME {volume} ===\n\n{vol_content}")
+            else:
+                print(f"⚠️ Failed to extract Volume {volume}")
+
+            volume += 1
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"⚠️ Error with Volume {volume}: {e}")
+            break
+
+    if parts:
+        return "\n\n".join(parts)
+    else:
+        return base_content or "No content extracted"
+
+
+def fetch_all_items_from_api(start_date, end_date, headers):
+    all_items = []
+    skip = 0
+    while True:
+        api_url = (
+            f"https://api.prod.legislation.gov.au/v1/titles/"
+            f"search(criteria='registrationdate({start_date},{end_date})')"
+            f"?$select=name,number,id,searchContexts,seriesType"
+            f"&$expand=searchContexts($expand=fullTextVersion)"
+            f"&$orderby=searchcontexts/fulltextversion/registeredat desc"
+            f"&$count=true&$top=100&$skip={skip}"
+        )
+        print(f"🔄 Fetching batch starting at skip={skip}")
+        response = requests.get(api_url, headers=headers)
+        if response.status_code != 200:
+            print("❌ Failed to fetch data from API.")
+            break
+
+        data = response.json()
+        items = data.get("value", [])
+        if not items:
+            break
+
+        all_items.extend(items)
+        if len(items) < 100:
+            break
+
+        skip += 100
+        time.sleep(1)
+
+    return all_items
+
+
+def main(days: int):
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    end_date = datetime.today().date()
+    start_date = end_date - timedelta(days=days)
+
+    start_date_str = start_date.strftime("%Y-%m-%d")
+    end_date_str = end_date.strftime("%Y-%m-%d")
+
+    print(f"\n🔍 Searching for Acts from {start_date_str} to {end_date_str}...\n")
+
+    results = []
+    items = fetch_all_items_from_api(start_date_str, end_date_str, headers)
+    print(f"✅ Found {len(items)} acts.\n")
+
+    for idx, item in enumerate(items, 1):
+        print(f"🔧 Processing {idx}/{len(items)}")
+
+        title = item.get("name", "N/A")
+        act_id = item.get("id", None)
+        if not act_id:
+            continue
+
+        url = f"https://www.legislation.gov.au/Details/{act_id}"
+        reg_date = item.get("searchContexts", [{}])[0].get("fullTextVersion", {}).get("registeredAt", "N/A")
+
+        if reg_date == "N/A":
+            continue
+
+        pdf_url = f"https://www.legislation.gov.au/{act_id}/{reg_date}/{reg_date}/text/original/pdf"
+
+        print(f"📄 Title: {title}")
+        print(f"    📅 Registered Date: {reg_date}")
+        print(f"    🔗 URL: {url}")
+        print(f"    📥 PDF URL: {pdf_url}")
+
+        content = extract_content_with_fallback(pdf_url, headers)
+        if len(content) > 10000:
+            content = content[:10000] + "... [TRUNCATED]"
+
+        results.append({
+            "Title": title,
+            "Registered Date": reg_date,
+            "URL": url,
+            "Content": content
+        })
+
+        time.sleep(1)
+
+    df = pd.DataFrame(results)
+    df.to_excel("australian_acts_scraped.xlsx", index=False)
+    print("\n✅ Done. Data saved to 'australian_acts_scraped.xlsx'")
+    print(df[["Title", "Registered Date", "URL", "Content"]].head())
+
+
+# === Entry point ===
+if __name__ == "__main__":
+    user_input = input("📆 Enter number of days to look back from today: ").strip()
+    try:
+        days = int(user_input)
+        if days <= 0:
+            raise ValueError
+        main(days)
+    except ValueError:
+        print("❌ Please enter a valid positive integer.")
