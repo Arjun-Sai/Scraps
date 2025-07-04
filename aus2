@@ -1,0 +1,119 @@
+import requests
+import pandas as pd
+from datetime import datetime, timedelta
+import time
+import io
+import PyPDF2
+
+def extract_pdf_content(pdf_url, headers):
+    try:
+        pdf_response = requests.get(pdf_url, headers=headers, timeout=30)
+        if pdf_response.status_code != 200:
+            return None
+        pdf_file = io.BytesIO(pdf_response.content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        text_content = []
+        for page in pdf_reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_content.append(page_text)
+        return " ".join(" ".join(text_content).split())
+    except Exception as e:
+        print(f"⚠️ Failed to extract PDF content: {e}")
+        return None
+
+def get_acts_from_api(start_date: str, end_date: str, headers):
+    results = []
+    skip = 0
+    batch_size = 100
+
+    while True:
+        api_url = (
+            f"https://api.prod.legislation.gov.au/v1/titles/"
+            f"search(criteria='registrationdate({start_date},{end_date})')"
+            f"?$select=id,name,year,searchContexts,collection"
+            f"&$expand=searchContexts($expand=fullTextVersion)"
+            f"&$orderby=searchContexts/fullTextVersion/registeredat desc"
+            f"&$count=true&$top={batch_size}&$skip={skip}"
+        )
+
+        print(f"\n🔎 Fetching batch (skip={skip})")
+        response = requests.get(api_url, headers=headers)
+        if response.status_code != 200:
+            print(f"❌ Request failed with status code {response.status_code}")
+            break
+
+        data = response.json()
+        items = data.get("value", [])
+        if not items:
+            print("✅ No more results.")
+            break
+
+        for item in items:
+            title = item.get("name", "N/A")
+            reg_date = "N/A"
+            pdf_url = None
+
+            try:
+                sc = item.get("searchContexts", [])
+                if sc:
+                    ftv = sc[0].get("fullTextVersion", {})
+                    reg_date = ftv.get("registeredAt", "N/A")[:10]
+                    pdf_url = ftv.get("url", None)
+            except:
+                pass
+
+            content = "N/A"
+            if pdf_url:
+                print(f"📄 Extracting content from: {pdf_url}")
+                content = extract_pdf_content(pdf_url, headers)
+                if content and len(content) > 10000:
+                    content = content[:10000] + "... [TRUNCATED]"
+
+            results.append({
+                "Title": title,
+                "Registered Date": reg_date,
+                "PDF URL": pdf_url if pdf_url else "N/A",
+                "Content": content if content else "N/A"
+            })
+
+            time.sleep(0.5)
+
+        skip += batch_size
+
+    return results
+
+def main():
+    try:
+        days = int(input("📆 Enter number of days to look back: ").strip())
+        if days <= 0:
+            raise ValueError
+    except ValueError:
+        print("❌ Please enter a valid positive number.")
+        return
+
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=days)
+
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
+
+    print(f"\n📅 Scraping Acts from {start_str} to {end_str}\n")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    data = get_acts_from_api(start_str, end_str, headers)
+
+    if not data:
+        print("❌ No data retrieved.")
+        return
+
+    df = pd.DataFrame(data)
+    df.to_excel("australian_legislation_scraped.xlsx", index=False)
+    print("\n✅ Done. Data saved to 'australian_legislation_scraped.xlsx'")
+    print(df[["Title", "Registered Date", "PDF URL"]].head())
+
+if __name__ == "__main__":
+    main()
