@@ -1,0 +1,163 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from urllib.parse import urljoin
+from datetime import datetime, timedelta
+import time
+import io
+import PyPDF2
+import re
+
+def extract_pdf_text_if_english(pdf_url, headers):
+    """
+    Downloads PDF, extracts text, and returns it only if it is mostly in English.
+    """
+    try:
+        response = requests.get(pdf_url, headers=headers, timeout=30)
+        if response.status_code != 200:
+            return None
+
+        pdf_file = io.BytesIO(response.content)
+        reader = PyPDF2.PdfReader(pdf_file)
+
+        text_pages = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                text_pages.append(text)
+
+        full_text = " ".join(text_pages)
+
+        # Check if text is mostly English using presence of a-zA-Z
+        english_ratio = len(re.findall(r'[a-zA-Z]', full_text)) / (len(full_text) + 1e-5)
+        if english_ratio < 0.3:
+            print("🚫 Skipping PDF (Not English)")
+            return None
+
+        return " ".join(full_text.split())
+
+    except Exception as e:
+        print(f"❌ PDF extraction error: {e}")
+        return None
+
+def extract_act_list_with_pdf(base_url, headers, year, start_date, end_date):
+    """
+    Extracts list of Acts for a given year, filters by enactment date, and extracts PDF content if English
+    """
+    full_url = (
+        f"{base_url}"
+        f"?page-token=032a83544a3b&page-token-value=98ed972cd138f7f10f4cc9e781e1e030"
+        f"&nccharset=8B2E7B36&location=%2F&query=&rpp=100"
+        f"&sort_by=dc.date.issued_dt&order=desc"
+        f"&filter_field_1=enactmentdate&filter_type_1=contains"
+        f"&filter_value_1={year}"
+    )
+
+    print(f"🔍 Fetching data for year {year} from:\n{full_url}\n")
+    response = requests.get(full_url, headers=headers)
+    if response.status_code != 200:
+        print("❌ Failed to fetch the page. Status code:", response.status_code)
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    rows = soup.select("tr")
+    results = []
+
+    for idx, row in enumerate(rows, 1):
+        try:
+            title_cell = row.select_one('td[headers="t3"]')
+            date_cell = row.select_one('td[headers="t1"]')
+            link_cell = row.select_one('td[headers="t4"] a')
+
+            if not title_cell or not date_cell or not link_cell:
+                continue
+
+            title = title_cell.get_text(strip=True)
+            date_str = date_cell.get_text(strip=True)
+
+            try:
+                date_obj = datetime.strptime(date_str, "%d-%b-%Y")
+            except ValueError:
+                continue
+
+            if not (start_date <= date_obj <= end_date):
+                continue
+
+            relative_link = link_cell.get("href", "").strip()
+            detail_url = urljoin("https://www.indiacode.nic.in", relative_link)
+
+            print(f"▶️ {idx}. Title: {title}")
+            print(f"    📅 Date: {date_str}")
+            print(f"    🔗 Details URL: {detail_url}")
+
+            # Step into the detail page to find the actual PDF link
+            detail_resp = requests.get(detail_url, headers=headers)
+            if detail_resp.status_code != 200:
+                print("    ⚠️ Failed to load detail page.")
+                continue
+
+            detail_soup = BeautifulSoup(detail_resp.text, "html.parser")
+            pdf_link_tag = detail_soup.select_one('a[href$=".pdf"]')
+
+            pdf_text = None
+            pdf_url = None
+            if pdf_link_tag:
+                pdf_url = urljoin("https://www.indiacode.nic.in", pdf_link_tag.get("href"))
+                print(f"    📄 PDF: {pdf_url}")
+                pdf_text = extract_pdf_text_if_english(pdf_url, headers)
+
+            results.append({
+                "Title": title,
+                "Date": date_str,
+                "Details Page URL": detail_url,
+                "PDF URL": pdf_url or "Not Found",
+                "Content (English only)": pdf_text or "Skipped / Not English"
+            })
+
+            time.sleep(0.5)
+
+        except Exception as e:
+            print(f"⚠️ Error processing row {idx}: {e}")
+            continue
+
+    return results
+
+def main_indiacode_scraper_with_pdf():
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    base_url = "https://www.indiacode.nic.in/handle/123456789/1362/simple-search"
+
+    try:
+        num_days = int(input("📆 Enter number of days to look back from today: ").strip())
+    except ValueError:
+        print("❌ Please enter a valid number.")
+        return
+
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=num_days)
+
+    print(f"\n🔎 Looking for Acts between {start_date.strftime('%d-%b-%Y')} and {end_date.strftime('%d-%b-%Y')}\n")
+
+    years = list(range(start_date.year, end_date.year + 1))
+
+    all_data = []
+    for year in years:
+        yearly_data = extract_act_list_with_pdf(base_url, headers, year, start_date, end_date)
+        all_data.extend(yearly_data)
+
+    if not all_data:
+        print("❌ No data extracted within the given date range.")
+        return
+
+    df = pd.DataFrame(all_data)
+    df.to_excel("indiacode_filtered_acts_with_pdf.xlsx", index=False)
+
+    print("\n✅ Done. Data saved to 'indiacode_filtered_acts_with_pdf.xlsx'")
+    pd.set_option("display.max_colwidth", None)
+    print("\n📄 Sample Preview:")
+    print(df.head())
+
+# Run it
+main_indiacode_scraper_with_pdf()
