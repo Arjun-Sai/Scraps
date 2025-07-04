@@ -1,0 +1,291 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from datetime import datetime
+import re
+import time
+from googletrans import Translator
+import logging
+from urllib.parse import urljoin, urlparse
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class JapaneseWebScraper:
+    def __init__(self, base_url="https://www.pdma.go.jp"):
+        self.base_url = base_url
+        self.session = requests.Session()
+        self.translator = Translator()
+        self.articles_data = []
+        
+        # Set headers to mimic a browser
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ja,en-US;q=0.7,en;q=0.3',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        })
+    
+    def translate_text(self, text, max_retries=3):
+        """Translate Japanese text to English with retry logic"""
+        if not text or text.strip() == "":
+            return ""
+        
+        for attempt in range(max_retries):
+            try:
+                # Clean the text
+                cleaned_text = re.sub(r'\s+', ' ', text.strip())
+                if len(cleaned_text) > 5000:  # Google Translate limit
+                    # Split long text into chunks
+                    chunks = [cleaned_text[i:i+4000] for i in range(0, len(cleaned_text), 4000)]
+                    translated_chunks = []
+                    for chunk in chunks:
+                        result = self.translator.translate(chunk, src='ja', dest='en')
+                        translated_chunks.append(result.text)
+                        time.sleep(0.1)  # Small delay between chunks
+                    return ' '.join(translated_chunks)
+                else:
+                    result = self.translator.translate(cleaned_text, src='ja', dest='en')
+                    return result.text
+                    
+            except Exception as e:
+                logger.warning(f"Translation attempt {attempt + 1} failed: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    logger.error(f"Failed to translate text after {max_retries} attempts")
+                    return text  # Return original text if translation fails
+    
+    def parse_date(self, date_text):
+        """Parse Japanese date format and convert to standard format"""
+        try:
+            # Remove HTML tags and extra whitespace
+            clean_date = re.sub(r'<.*?>', '', date_text).strip()
+            
+            # Try to parse different date formats
+            date_patterns = [
+                r'(\d{4})年(\d{1,2})月(\d{1,2})日',  # Japanese format: 2025年7月4日
+                r'(\d{1,2})/(\d{1,2})/(\d{4})',      # MM/DD/YYYY
+                r'(\d{4})-(\d{1,2})-(\d{1,2})',      # YYYY-MM-DD
+                r'(\d{1,2})\.(\d{1,2})\.(\d{4})',    # DD.MM.YYYY
+            ]
+            
+            for pattern in date_patterns:
+                match = re.search(pattern, clean_date)
+                if match:
+                    if '年' in pattern:  # Japanese format
+                        year, month, day = match.groups()
+                        return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+                    else:
+                        groups = match.groups()
+                        if len(groups) == 3:
+                            if pattern.startswith(r'(\d{4})'):  # YYYY-MM-DD
+                                year, month, day = groups
+                            else:  # MM/DD/YYYY or DD.MM.YYYY
+                                month, day, year = groups
+                            return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+            
+            # If no pattern matches, try to extract just the date
+            translated_date = self.translate_text(clean_date)
+            logger.info(f"Translated date: {translated_date}")
+            return translated_date
+            
+        except Exception as e:
+            logger.error(f"Error parsing date '{date_text}': {str(e)}")
+            return date_text
+    
+    def get_page_content(self, url):
+        """Fetch page content with error handling"""
+        try:
+            response = self.session.get(url, timeout=30)
+            response.raise_for_status()
+            response.encoding = 'utf-8'
+            return response.text
+        except requests.RequestException as e:
+            logger.error(f"Error fetching {url}: {str(e)}")
+            return None
+    
+    def extract_article_links(self, html_content):
+        """Extract article links from the main page"""
+        soup = BeautifulSoup(html_content, 'html.parser')
+        article_links = []
+        
+        # Look for various link patterns that might contain articles
+        link_selectors = [
+            'a[href*="procurement"]',
+            'a[href*="0209"]',
+            'a[href*="/0"]',
+            'a[href$=".html"]',
+            '.news-item a',
+            '.article-link',
+            '.content-link'
+        ]
+        
+        for selector in link_selectors:
+            links = soup.select(selector)
+            for link in links:
+                href = link.get('href')
+                if href:
+                    full_url = urljoin(self.base_url, href)
+                    article_links.append(full_url)
+        
+        # Remove duplicates while preserving order
+        unique_links = list(dict.fromkeys(article_links))
+        logger.info(f"Found {len(unique_links)} potential article links")
+        return unique_links
+    
+    def extract_article_content(self, url):
+        """Extract article content from individual article page"""
+        html_content = self.get_page_content(url)
+        if not html_content:
+            return None
+        
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Extract title
+        title_selectors = ['h1', 'h2', '.title', '.article-title', 'title']
+        title = ""
+        for selector in title_selectors:
+            title_elem = soup.select_one(selector)
+            if title_elem:
+                title = title_elem.get_text(strip=True)
+                break
+        
+        # Extract date
+        date_selectors = ['.date', '.published-date', '.post-date', 'time', '[class*="date"]']
+        date = ""
+        for selector in date_selectors:
+            date_elem = soup.select_one(selector)
+            if date_elem:
+                date = date_elem.get_text(strip=True)
+                break
+        
+        # Extract main content
+        content_selectors = [
+            '.content', '.article-content', '.post-content', 
+            '.main-content', 'main', '.body', '.text',
+            'div[class*="content"]', 'div[class*="article"]'
+        ]
+        content = ""
+        for selector in content_selectors:
+            content_elem = soup.select_one(selector)
+            if content_elem:
+                # Remove script and style elements
+                for script in content_elem(["script", "style"]):
+                    script.decompose()
+                content = content_elem.get_text(separator='\n', strip=True)
+                break
+        
+        # If no specific content found, try to get all text from body
+        if not content:
+            body = soup.find('body')
+            if body:
+                # Remove navigation, header, footer, sidebar elements
+                for elem in body(["nav", "header", "footer", "aside", "script", "style"]):
+                    elem.decompose()
+                content = body.get_text(separator='\n', strip=True)
+        
+        return {
+            'title': title,
+            'date': date,
+            'content': content
+        }
+    
+    def scrape_articles(self, main_url):
+        """Main scraping function"""
+        logger.info(f"Starting to scrape articles from {main_url}")
+        
+        # Get main page content
+        html_content = self.get_page_content(main_url)
+        if not html_content:
+            logger.error("Failed to fetch main page content")
+            return pd.DataFrame()
+        
+        # Extract article links
+        article_links = self.extract_article_links(html_content)
+        
+        if not article_links:
+            logger.warning("No article links found. Trying alternative approach...")
+            # Try to extract content from the main page itself
+            article_data = self.extract_article_content(main_url)
+            if article_data and article_data['title']:
+                article_links = [main_url]
+        
+        # Process each article
+        for i, url in enumerate(article_links[:10]):  # Limit to first 10 articles
+            logger.info(f"Processing article {i+1}/{len(article_links[:10])}: {url}")
+            
+            try:
+                article_data = self.extract_article_content(url)
+                if article_data:
+                    # Translate content
+                    translated_title = self.translate_text(article_data['title'])
+                    translated_content = self.translate_text(article_data['content'])
+                    parsed_date = self.parse_date(article_data['date'])
+                    
+                    self.articles_data.append({
+                        'Article Title': translated_title,
+                        'Published Date': parsed_date,
+                        'URL': url,
+                        'Content': translated_content
+                    })
+                    
+                    logger.info(f"Successfully processed: {translated_title[:50]}...")
+                    
+                # Add delay between requests to be respectful
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Error processing article {url}: {str(e)}")
+                continue
+        
+        # Create DataFrame
+        df = pd.DataFrame(self.articles_data)
+        logger.info(f"Successfully scraped {len(df)} articles")
+        return df
+    
+    def save_to_csv(self, df, filename="japanese_articles_translated.csv"):
+        """Save DataFrame to CSV file"""
+        try:
+            df.to_csv(filename, index=False, encoding='utf-8')
+            logger.info(f"Data saved to {filename}")
+        except Exception as e:
+            logger.error(f"Error saving to CSV: {str(e)}")
+
+# Usage example
+def main():
+    # Initialize scraper
+    scraper = JapaneseWebScraper()
+    
+    # URL to scrape
+    main_url = "https://www.pdma.go.jp/0017.html"
+    
+    # Scrape articles
+    df = scraper.scrape_articles(main_url)
+    
+    # Display results
+    if not df.empty:
+        print("\nScraping Results:")
+        print(f"Total articles scraped: {len(df)}")
+        print("\nFirst few articles:")
+        print(df.head())
+        
+        # Save to CSV
+        scraper.save_to_csv(df)
+        
+        # Save to Excel for better formatting
+        try:
+            df.to_excel("japanese_articles_translated.xlsx", index=False)
+            print("Data also saved to Excel file")
+        except:
+            print("Excel save failed, but CSV file is available")
+    else:
+        print("No articles were scraped successfully")
+
+if __name__ == "__main__":
+    main()
