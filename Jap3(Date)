@@ -1,0 +1,291 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from datetime import datetime
+import re
+import time
+from googletrans import Translator
+import logging
+from urllib.parse import urljoin, urlparse
+import warnings
+import urllib3
+warnings.filterwarnings('ignore')
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class JapaneseWebScraper:
+    def __init__(self, base_url="https://www.pmda.go.jp"):
+        self.base_url = base_url
+        self.session = requests.Session()
+        self.translator = Translator()
+        self.articles_data = []
+
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ja,en-US;q=0.7,en;q=0.3',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        })
+
+    def translate_text(self, text, max_retries=3):
+        if not text or text.strip() == "":
+            return ""
+        for attempt in range(max_retries):
+            try:
+                cleaned_text = re.sub(r'\s+', ' ', text.strip())
+                if len(cleaned_text) > 5000:
+                    chunks = [cleaned_text[i:i+4000] for i in range(0, len(cleaned_text), 4000)]
+                    translated_chunks = []
+                    for chunk in chunks:
+                        result = self.translator.translate(chunk, src='ja', dest='en')
+                        translated_chunks.append(result.text)
+                        time.sleep(0.1)
+                    return ' '.join(translated_chunks)
+                else:
+                    result = self.translator.translate(cleaned_text, src='ja', dest='en')
+                    return result.text
+            except Exception as e:
+                logger.warning(f"Translation attempt {attempt + 1} failed: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    logger.error(f"Failed to translate text after {max_retries} attempts")
+                    return text
+
+    def parse_date(self, date_text):
+        if not date_text:
+            return None
+        try:
+            clean_date = re.sub(r'<.*?>', '', str(date_text)).strip()
+            date_patterns = [
+                r'(\d{4})年(\d{1,2})月(\d{1,2})日',
+                r'(\d{4})/(\d{1,2})/(\d{1,2})',
+                r'(\d{4})-(\d{1,2})-(\d{1,2})',
+                r'(\d{1,2})/(\d{1,2})/(\d{4})',
+                r'(\d{1,2})-(\d{1,2})-(\d{4})',
+                r'(\d{1,2})\.(\d{1,2})\.(\d{4})',
+                r'(\d{4})\.(\d{1,2})\.(\d{1,2})',
+                r'令和(\d+)年(\d{1,2})月(\d{1,2})日',
+            ]
+            for i, pattern in enumerate(date_patterns):
+                match = re.search(pattern, clean_date)
+                if match:
+                    groups = match.groups()
+                    if i == 7:
+                        reiwa_year = int(groups[0])
+                        year = 2018 + reiwa_year
+                        month, day = groups[1], groups[2]
+                        return datetime(year, int(month), int(day)).date()
+                    elif i in [0, 1, 2, 6]:
+                        year, month, day = map(int, groups)
+                        return datetime(year, month, day).date()
+                    elif i in [3, 4, 5]:
+                        if i == 5:
+                            day, month, year = map(int, groups)
+                        else:
+                            month, day, year = map(int, groups)
+                        return datetime(year, month, day).date()
+
+            numbers = re.findall(r'\d+', clean_date)
+            if len(numbers) >= 3:
+                year_candidates = [n for n in numbers if len(n) == 4 and n.startswith('20')]
+                if year_candidates:
+                    year = int(year_candidates[0])
+                    remaining = [int(n) for n in numbers if int(n) != year]
+                    if len(remaining) >= 2:
+                        month, day = remaining[0], remaining[1]
+                        return datetime(year, month, day).date()
+
+            if any(char in clean_date for char in ['年', '月', '日', '令和', '平成']):
+                translated_date = self.translate_text(clean_date)
+                logger.info(f"Translated date: '{clean_date}' -> '{translated_date}'")
+                try:
+                    return datetime.strptime(translated_date, "%Y-%m-%d").date()
+                except:
+                    return None
+
+            try:
+                return datetime.strptime(clean_date, "%Y-%m-%d").date()
+            except:
+                return None
+        except Exception as e:
+            logger.error(f"Error parsing date '{date_text}': {str(e)}")
+            return None
+
+    def test_url_accessibility(self, url):
+        try:
+            response = self.session.head(url, timeout=10, verify=False)
+            return response.status_code == 200
+        except:
+            return False
+
+    def find_news_or_articles_page(self):
+        potential_urls = [
+            "https://www.pmda.go.jp/0017.html",
+            "https://www.pmda.go.jp/english/",
+            "https://www.pmda.go.jp/",
+            "https://www.pmda.go.jp/news/",
+            "https://www.pmda.go.jp/english/news/",
+            "https://www.pmda.go.jp/information/",
+            "https://www.pmda.go.jp/english/information/"
+        ]
+        accessible_urls = []
+        for url in potential_urls:
+            if self.test_url_accessibility(url):
+                accessible_urls.append(url)
+                logger.info(f"✓ Accessible: {url}")
+            else:
+                logger.info(f"✗ Not accessible: {url}")
+        return accessible_urls
+
+    def get_page_content(self, url):
+        try:
+            response = self.session.get(url, timeout=30, verify=False)
+            response.raise_for_status()
+            response.encoding = 'utf-8'
+            return response.text
+        except requests.RequestException as e:
+            logger.error(f"Error fetching {url}: {str(e)}")
+            return None
+
+    def extract_article_links(self, html_content):
+        soup = BeautifulSoup(html_content, 'html.parser')
+        article_links = []
+        link_selectors = [
+            'a[href*="procurement"]',
+            'a[href*="0209"]',
+            'a[href*="/0"]',
+            'a[href$=".html"]',
+            '.news-item a',
+            '.article-link',
+            '.content-link'
+        ]
+        for selector in link_selectors:
+            links = soup.select(selector)
+            for link in links:
+                href = link.get('href')
+                if href:
+                    full_url = urljoin(self.base_url, href)
+                    article_links.append(full_url)
+        return list(dict.fromkeys(article_links))
+
+    def extract_article_content(self, url):
+        html_content = self.get_page_content(url)
+        if not html_content:
+            return None
+        soup = BeautifulSoup(html_content, 'html.parser')
+        title = ""
+        for selector in ['h1', 'h2', 'h3', '.title', '.page-title', '.entry-title', '.headline', '[class*="title"]']:
+            elem = soup.select_one(selector)
+            if elem:
+                title = elem.get_text(strip=True)
+                if len(title) > 10:
+                    break
+        date = ""
+        for selector in ['.date', '.published-date', '.entry-date', 'time', '[class*="date"]']:
+            elem = soup.select_one(selector)
+            if elem:
+                date = elem.get_text(strip=True)
+                break
+        content = ""
+        for selector in ['.content', '.article-content', '.main-content', 'main', '.news-body']:
+            elem = soup.select_one(selector)
+            if elem:
+                for tag in elem(['script', 'style', 'nav', 'footer']):
+                    tag.decompose()
+                content = elem.get_text(separator='\n', strip=True)
+                if len(content) > 100:
+                    break
+        return {'title': title, 'date': date, 'content': content}
+
+    def scrape_articles(self, main_url):
+        logger.info(f"Starting to scrape articles from {main_url}")
+        if not self.test_url_accessibility(main_url):
+            logger.error(f"URL {main_url} is not accessible. Searching for alternatives...")
+            alt_urls = self.find_news_or_articles_page()
+            if alt_urls:
+                main_url = alt_urls[0]
+            else:
+                return pd.DataFrame()
+        html_content = self.get_page_content(main_url)
+        if not html_content:
+            return pd.DataFrame()
+        article_links = self.extract_article_links(html_content)
+        if not article_links:
+            data = self.extract_article_content(main_url)
+            if data and data['title']:
+                article_links = [main_url]
+        for url in article_links[:10]:
+            logger.info(f"Processing: {url}")
+            try:
+                data = self.extract_article_content(url)
+                if data:
+                    parsed_date = self.parse_date(data['date'])
+                    translated_title = self.translate_text(data['title'])
+                    translated_content = self.translate_text(data['content'])
+                    self.articles_data.append({
+                        'Article Title': translated_title,
+                        'Published Date': parsed_date,
+                        'URL': url,
+                        'Content': translated_content
+                    })
+                time.sleep(1)
+            except Exception as e:
+                logger.error(f"Failed to process {url}: {str(e)}")
+        return pd.DataFrame(self.articles_data)
+
+    def save_to_csv(self, df, filename="japanese_articles_translated.csv"):
+        try:
+            df.to_csv(filename, index=False, encoding='utf-8')
+            logger.info(f"Data saved to {filename}")
+        except Exception as e:
+            logger.error(f"Error saving to CSV: {str(e)}")
+
+# ===========================
+# Main function with date filtering
+# ===========================
+def main():
+    print("Enter the date range to filter articles.")
+    start_input = input("Start date (YYYY-MM-DD): ").strip()
+    end_input = input("End date (YYYY-MM-DD): ").strip()
+
+    try:
+        start_date = datetime.strptime(start_input, "%Y-%m-%d").date()
+        end_date = datetime.strptime(end_input, "%Y-%m-%d").date()
+    except ValueError:
+        print("❌ Invalid date format. Please use YYYY-MM-DD.")
+        return
+
+    scraper = JapaneseWebScraper()
+    main_url = "https://www.pmda.go.jp/0017.html"
+    df = scraper.scrape_articles(main_url)
+
+    if df.empty:
+        print("No articles scraped.")
+        return
+
+    df['Published Date'] = pd.to_datetime(df['Published Date'], errors='coerce').dt.date
+    df = df[(df['Published Date'] >= start_date) & (df['Published Date'] <= end_date)]
+
+    if df.empty:
+        print("No articles found in the given date range.")
+        return
+
+    print("\nFiltered Articles:")
+    print(df[['Article Title', 'Published Date', 'URL']].head())
+
+    scraper.save_to_csv(df)
+
+    try:
+        df.to_excel("japanese_articles_filtered.xlsx", index=False)
+        print("Data also saved to Excel.")
+    except Exception as e:
+        print(f"Excel save failed: {e}")
+
+if __name__ == "__main__":
+    main()
