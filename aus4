@@ -1,0 +1,162 @@
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
+import pandas as pd
+import time
+import io
+import PyPDF2
+import math
+
+def extract_pdf_content(pdf_url, headers):
+    try:
+        pdf_response = requests.get(pdf_url, headers=headers, timeout=30)
+        if pdf_response.status_code != 200:
+            return None
+        pdf_file = io.BytesIO(pdf_response.content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        text_content = []
+        for page in pdf_reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_content.append(page_text)
+        return " ".join(" ".join(text_content).split())
+    except Exception:
+        return None
+
+def extract_content_with_fallback(base_pdf_url, headers):
+    print(f"Trying base PDF...")
+    base_content = extract_pdf_content(base_pdf_url, headers)
+    if base_content:
+        print("✅ Base PDF worked.")
+        return base_content
+
+    print("❌ Base failed. Trying multivolume fallback...")
+    content_parts = []
+    volume = 1
+    while True:
+        volume_url = f"{base_pdf_url}/{volume}"
+        try:
+            response = requests.get(volume_url, headers=headers, timeout=15)
+            if response.status_code != 200:
+                print(f"🛑 Volume {volume} not found.")
+                break
+            print(f"📄 Volume {volume} found, extracting...")
+            vol_text = extract_pdf_content(volume_url, headers)
+            if vol_text:
+                content_parts.append(f"=== VOLUME {volume} ===\n\n{vol_text}")
+            else:
+                break
+        except Exception as e:
+            print(f"⚠️ Volume {volume} error: {e}")
+            break
+        volume += 1
+        time.sleep(0.5)
+
+    return "\n\n" + ("\n\n" + "="*60 + "\n\n").join(content_parts) if content_parts else "No content extracted"
+
+def get_total_acts_count(start_date, end_date, headers):
+    # Use API to get total number of acts
+    api_url = (
+        f"https://api.prod.legislation.gov.au/v1/titles/search("
+        f"criteria='registrationdate({start_date},{end_date})')"
+        f"?$count=true"
+    )
+    response = requests.get(api_url, headers=headers)
+    if response.status_code != 200:
+        return 0
+    return response.json().get("count", 0)
+
+def scrape_acts(days):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    today = datetime.today().date()
+    start_date = (today - timedelta(days=days)).isoformat()
+    end_date = today.isoformat()
+
+    print(f"\n🔎 Scraping acts from {start_date} to {end_date}...\n")
+
+    total_acts = get_total_acts_count(start_date, end_date, headers)
+    print(f"🧾 Total Acts to scrape: {total_acts}")
+
+    acts_per_page = 100
+    total_pages = math.ceil(total_acts / acts_per_page)
+
+    results = []
+    base_search_url = f"https://www.legislation.gov.au/search/registrationdate({start_date},{end_date})/collection(act)/sort(registeredat%20desc)?startIndex="
+
+    for page in range(total_pages):
+        print(f"\n🌐 Processing page {page+1}/{total_pages}")
+        page_start = page * acts_per_page
+        page_url = base_search_url + str(page_start)
+
+        response = requests.get(page_url, headers=headers)
+        if response.status_code != 200:
+            print(f"❌ Failed to fetch page {page+1}")
+            continue
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        items = soup.select("frl-grid-cell-title-name-in-force .title-name a")
+
+        print(f"📄 Found {len(items)} acts on this page.")
+
+        for idx, item in enumerate(items, 1):
+            try:
+                title = item.text.strip()
+                relative_link = item.get("href", "").strip()
+                full_url = "https://www.legislation.gov.au" + relative_link
+
+                reg_info = item.find_parent().find_next_sibling("div")
+                reg_date = "N/A"
+                if reg_info and "Registered:" in reg_info.text:
+                    reg_date = reg_info.get_text(strip=True).split("Registered:")[-1].strip()
+
+                effective_date = "N/A"
+                content = "N/A"
+                download_link = "N/A"
+
+                act_id = relative_link.split("/")[1] if relative_link else None
+                detail_response = requests.get(full_url, headers=headers)
+                if detail_response.status_code == 200:
+                    detail_soup = BeautifulSoup(detail_response.text, "html.parser")
+                    eff_span = detail_soup.select_one("span.date-effective-start")
+                    if eff_span:
+                        effective_date = eff_span.text.strip()
+                        try:
+                            eff_dt_obj = datetime.strptime(effective_date, "%d %B %Y")
+                            eff_dt_str = eff_dt_obj.strftime("%Y-%m-%d")
+                            pdf_url = f"https://www.legislation.gov.au/{act_id}/{eff_dt_str}/{eff_dt_str}/text/original/pdf"
+                            download_link = pdf_url
+                            print(f"📥 Extracting content from: {pdf_url}")
+                            content = extract_content_with_fallback(pdf_url, headers)
+
+                            if len(content) > 10000:
+                                content = content[:10000] + "... [TRUNCATED]"
+                        except Exception as e:
+                            print(f"⚠️ Date parsing failed: {e}")
+                time.sleep(0.5)
+
+                results.append({
+                    "Title": title,
+                    "Registered Date": reg_date,
+                    "URL": full_url,
+                    "Content": content
+                })
+
+            except Exception as e:
+                print(f"⚠️ Error processing item {idx}: {e}")
+                continue
+
+    df = pd.DataFrame(results)
+    df.to_excel("australian_acts_hybrid.xlsx", index=False)
+    print("\n✅ Done. Data saved to 'australian_acts_hybrid.xlsx'")
+    print(df[["Title", "Registered Date", "URL", "Content"]].head())
+
+# === Entry Point ===
+if __name__ == "__main__":
+    user_input = input("📆 Enter number of days to look back from today: ").strip()
+    try:
+        days = int(user_input)
+        if days <= 0:
+            raise ValueError
+        scrape_acts(days)
+    except ValueError:
+        print("❌ Please enter a valid positive integer.")
