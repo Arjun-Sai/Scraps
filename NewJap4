@@ -1,0 +1,216 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from datetime import datetime, timedelta
+import re
+from googletrans import Translator
+import time
+
+class PMDAScraper:
+    def __init__(self):
+        self.base_url = "https://www.pmda.go.jp/0017.html"
+        self.translator = Translator()
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+
+    def parse_japanese_date(self, date_str):
+        match = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', date_str)
+        if match:
+            year, month, day = match.groups()
+            return datetime(int(year), int(month), int(day))
+        return None
+
+    def translate_text(self, text, max_retries=3):
+        if not text or text.strip() == "":
+            return ""
+        for attempt in range(max_retries):
+            try:
+                if len(text) > 4000:
+                    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+                    translated = [self.translator.translate(chunk, src='ja', dest='en').text for chunk in chunks]
+                    return " ".join(translated)
+                else:
+                    return self.translator.translate(text, src='ja', dest='en').text
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    print(f"Translation failed: {str(e)}")
+                    return text
+
+    def scrape_articles(self, days_back=None):
+        try:
+            print("Fetching webpage...")
+            response = self.session.get(self.base_url, timeout=30)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            articles = []
+
+            # Find the <ul class="list_news">
+            list_news = soup.find('ul', class_='list_news')
+            if not list_news:
+                print("No news list found on the page.")
+                return []
+
+            # Find all <li> inside it
+            article_items = list_news.find_all('li')
+            print(f"Found {len(article_items)} articles in list_news.")
+
+            cutoff_date = datetime.now() - timedelta(days=days_back) if days_back else None
+
+            for item in article_items:
+                try:
+                    # Date
+                    date_elem = item.find('p', class_='date')
+                    date_str = date_elem.get_text(strip=True) if date_elem else ""
+                    article_date = self.parse_japanese_date(date_str)
+                    if not article_date:
+                        continue
+                    if cutoff_date and article_date < cutoff_date:
+                        continue
+
+                    # Title
+                    title_elem = item.find('p', class_='title')
+                    title_ja = title_elem.get_text(strip=True) if title_elem else ""
+                    if not title_ja or len(title_ja) < 3:
+                        continue
+
+                    # URL
+                    link_elem = item.find('a', href=True)
+                    if link_elem:
+                        href = link_elem['href']
+                        if href.startswith('http'):
+                            url = href
+                        elif href.startswith('/'):
+                            url = f"https://www.pmda.go.jp{href}"
+                        else:
+                            url = f"https://www.pmda.go.jp/0017/html/{href}"
+                    else:
+                        url = ""
+
+                    # Category
+                    category_elem = item.find('p', class_=re.compile(r'category', re.I))
+                    category_ja = category_elem.get_text(strip=True) if category_elem else ""
+
+                    # Use title as content (since we don't fetch full article here)
+                    content_ja = title_ja
+
+                    print(f"✅ Article: {title_ja} | Date: {article_date.date()} | Category: {category_ja} | URL: {url}")
+
+                    articles.append({
+                        'title_ja': title_ja,
+                        'date': article_date,
+                        'url': url,
+                        'content_ja': content_ja,
+                        'category_ja': category_ja
+                    })
+                except Exception as e:
+                    print(f"Error processing item: {str(e)}")
+                    continue
+
+            print(f"Extracted {len(articles)} articles before deduplication.")
+            return articles
+        except Exception as e:
+            print(f"Error fetching webpage: {str(e)}")
+            return []
+
+    def process_articles(self, articles, translate=True):
+        processed = []
+        for idx, article in enumerate(articles, 1):
+            print(f"Processing article {idx}/{len(articles)}: {article['title_ja'][:50]}...")
+            try:
+                if translate:
+                    title_en = self.translate_text(article['title_ja'])
+                    content_en = self.translate_text(article['content_ja'])
+                    category_en = self.translate_text(article['category_ja']) if article['category_ja'] else ""
+                else:
+                    title_en = article['title_ja']
+                    content_en = article['content_ja']
+                    category_en = article['category_ja']
+
+                processed.append({
+                    'Article Title': title_en,
+                    'Published Date': article['date'].strftime('%Y-%m-%d'),
+                    'URL': article['url'],
+                    'Content': content_en,
+                    'Category': category_en
+                })
+                if translate:
+                    time.sleep(0.5)
+            except Exception as e:
+                print(f"Error processing: {str(e)}")
+                processed.append({
+                    'Article Title': article['title_ja'],
+                    'Published Date': article['date'].strftime('%Y-%m-%d'),
+                    'URL': article['url'],
+                    'Content': article['content_ja'],
+                    'Category': article['category_ja']
+                })
+        return processed
+
+    def save_to_excel(self, df, filename=None):
+        filename = filename or f"pmda_articles_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        try:
+            df.to_excel(filename, index=False, engine='openpyxl')
+            print(f"Saved to {filename}")
+            return filename
+        except Exception as e:
+            print(f"Error saving Excel: {str(e)}")
+            return None
+
+    def run_scraper(self, days_back=None, translate=True, save_excel=True):
+        print("Starting PMDA scraper...")
+        articles = self.scrape_articles(days_back)
+        if not articles:
+            print("No articles found.")
+            return None
+
+        processed = self.process_articles(articles, translate)
+        df = pd.DataFrame(processed)
+
+        # Deduplicate
+        before = len(df)
+        df.drop_duplicates(subset=['Article Title', 'Published Date', 'URL'], inplace=True)
+        after = len(df)
+        print(f"Removed {before - after} duplicate articles.")
+
+        # Sort by newest first
+        df['Published Date'] = pd.to_datetime(df['Published Date'])
+        df = df.sort_values('Published Date', ascending=False)
+        df['Published Date'] = df['Published Date'].dt.strftime('%Y-%m-%d')
+
+        print(f"Processed {len(df)} articles after cleanup.")
+        if save_excel:
+            self.save_to_excel(df)
+        return df
+
+def main():
+    scraper = PMDAScraper()
+    print("PMDA Article Scraper\n===================")
+    days_back = None
+    while True:
+        days_input = input("Enter number of days to look back (or Enter for all): ").strip()
+        if days_input == "":
+            break
+        try:
+            days_back = int(days_input)
+            if days_back < 0:
+                print("Please enter a positive number.")
+                continue
+            break
+        except ValueError:
+            print("Please enter a valid number.")
+
+    translate = input("Translate to English? (y/n, default y): ").strip().lower() in ['', 'y', 'yes']
+    save_excel = input("Save to Excel? (y/n, default y): ").strip().lower() in ['', 'y', 'yes']
+
+    df = scraper.run_scraper(days_back, translate, save_excel)
+    if df is not None:
+        print("\nFirst few articles:")
+        print(df.head())
+        print(f"\nTotal articles: {len(df)}")
+
+if __name__ == "__main__":
+    main()
