@@ -1,0 +1,129 @@
+elif page == "Forecasting":
+
+    st.title("📈 Forecasting using Ridge Regression")
+
+    if "raw" not in st.session_state.dataframes:
+        st.warning("No financial data found. Please upload PDF files first in the 'Upload Data' section.")
+    else:
+        import numpy as np
+        import pandas as pd
+        from sklearn.linear_model import Ridge
+        from sklearn.metrics import mean_squared_error, r2_score
+
+        # Use df_raw from session state
+        df_raw = st.session_state.dataframes["raw"]
+
+        # Pivot the data (like in Trends section)
+        pivot_df = df_raw.pivot_table(index="Line item", columns="year", values="value", aggfunc="first").sort_index(axis=1)
+        df = pivot_df.T.reset_index().rename(columns={"index": "Year"})
+        df.columns = df.columns.str.strip()
+
+        st.write("📊 Pivoted DataFrame (Transposed):")
+        st.dataframe(df.head(), use_container_width=True)
+
+        # Define target items and required ones
+        target_items = {
+            "Operating": "Cash provided by operating activities",
+            "Investing": "Cash used in investing activities",
+            "Financing": "Cash used in financing activities",
+            "Cash Change": "Increase (Decrease) in cash and cash equivalents",
+            "Opening": "Cash and cash equivalents at beginning of year",
+            "Closing": "Cash and cash equivalents at end of year",
+        }
+
+        forecast_year = 2024
+        df_train = df[df["Year"] < forecast_year]
+        df_2024 = df[df["Year"] == forecast_year]
+
+        results = []
+
+        # Train separate models for each category
+        for category, item_name in target_items.items():
+            if category not in ["Operating", "Investing", "Financing"]:
+                continue
+
+            if item_name not in df.columns:
+                st.warning(f"'{item_name}' is missing from the dataset. Skipping {category}.")
+                continue
+
+            feature_cols = [val for key, val in target_items.items() if key not in ["Cash Change", "Opening", "Closing", category]]
+            if any(col not in df.columns for col in feature_cols):
+                st.warning(f"One or more feature columns missing for {category}.")
+                continue
+
+            try:
+                X_train = df_train[feature_cols].values
+                y_train = df_train[item_name].values
+
+                X_test = df_2024[feature_cols].values
+                y_test = df_2024[item_name].values if item_name in df_2024 else [None]
+
+                model = Ridge(alpha=1000, max_iter=50)
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_test)
+
+                rmse = np.sqrt(mean_squared_error(y_train, model.predict(X_train)))
+                r2 = r2_score(y_train, model.predict(X_train))
+
+                results.append({
+                    "Category": category,
+                    "Actual": y_test[0] if len(y_test) > 0 else None,
+                    "Predicted": y_pred[0],
+                    "Train RMSE": rmse,
+                    "Train R²": r2
+                })
+
+            except Exception as e:
+                st.error(f"Error while forecasting {category}: {str(e)}")
+
+        # Display prediction results
+        if results:
+            st.subheader("🔍 Model Results for Operating, Investing, Financing")
+            st.dataframe(pd.DataFrame(results), use_container_width=True)
+
+            # Compute deterministic values
+            pred_df = pd.DataFrame(results)
+            try:
+                operating = pred_df.loc[pred_df["Category"] == "Operating", "Predicted"].values[0]
+                investing = pred_df.loc[pred_df["Category"] == "Investing", "Predicted"].values[0]
+                financing = pred_df.loc[pred_df["Category"] == "Financing", "Predicted"].values[0]
+            except IndexError:
+                st.warning("Unable to extract predicted values for all categories.")
+                st.stop()
+
+            cash_change = operating + investing + financing
+
+            # Get opening balance for 2024 (prefer from 2024 row; fallback to 2023 closing)
+            if target_items["Opening"] in df.columns and forecast_year in df["Year"].values:
+                opening_balance = df.loc[df["Year"] == forecast_year, target_items["Opening"]].values[0]
+            elif target_items["Closing"] in df.columns and (forecast_year - 1) in df["Year"].values:
+                opening_balance = df.loc[df["Year"] == (forecast_year - 1), target_items["Closing"]].values[0]
+            else:
+                opening_balance = np.nan
+
+            closing_balance = opening_balance + cash_change if not np.isnan(opening_balance) else np.nan
+
+            # Show computed forecast summary
+            st.subheader("🧾 Final Forecast Summary for 2024")
+            summary_data = {
+                "Category": [
+                    "Cash from Operating Activities",
+                    "Cash used in Investing Activities",
+                    "Cash used in Financing Activities",
+                    "Increase / Decrease in Cash",
+                    "Opening Cash Balance",
+                    "Closing Cash Balance"
+                ],
+                "Forecasted Value": [
+                    operating,
+                    investing,
+                    financing,
+                    cash_change,
+                    opening_balance,
+                    closing_balance
+                ]
+            }
+            st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
+
+        else:
+            st.warning("No results to display.")
